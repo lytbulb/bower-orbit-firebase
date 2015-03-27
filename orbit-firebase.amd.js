@@ -1,227 +1,107 @@
-define('orbit-firebase/array-utils', ['exports'], function (exports) {
-
-	'use strict';
-
-	exports.removeItem = removeItem;
-	exports.removeAt = removeAt;
-
-	function removeItem(array, condemned){
-		return array.filter(function(item){
-			return item !== condemned;
-		});
-	}
-
-	function removeAt(array, index){
-		var working = array.splice(0);
-		working.splice(index, 1);
-		return working;
-	}
-
-});
-define('orbit-firebase/cache-utils', ['exports', 'orbit/lib/objects'], function (exports, objects) {
+define('orbit-firebase/cache-source', ['exports', 'orbit/transformable', 'orbit/lib/objects'], function (exports, Transformable, objects) {
 
 	'use strict';
 
 	exports['default'] = objects.Class.extend({
 		init: function(cache){
-			this.cache = cache;
+			Transformable['default'].extend(this);
+			this._cache = cache;
+			objects.expose(this, this._cache, ['retrieve']);
 		},
 
-		retrieveLink: function(type, id, link) {
-			var val = this.cache.retrieve([type, id, '__rel', link]);
-			if (val !== null && typeof val === 'object') {
-				val = Object.keys(val);
-			}
-			return val;
-		},
+		_transform: function(operations){
+			console.log("transforming cache", operations);
+			var _this = this;
+			operations = objects.isArray(operations) ? operations : [operations];
+
+			operations.forEach(function(operation){
+				_this._cache.transform(operation);
+			});
+		}
 	});
 
 });
-define('orbit-firebase/firebase-cache', ['exports', 'orbit/lib/objects', 'orbit-firebase/schema-utils', 'orbit-firebase/cache-utils', 'orbit/evented'], function (exports, objects, SchemaUtils, CacheUtils, Evented) {
+define('orbit-firebase/eager-relationship-loader', ['exports', 'orbit/lib/objects'], function (exports, objects) {
 
 	'use strict';
 
 	exports['default'] = objects.Class.extend({
-		init: function(cache, serializer, schema){
-			Evented['default'].extend(this);
-			this._cache = cache;
-			this._cacheUtils = new CacheUtils['default'](cache);
-			this._serializer = serializer;
-			this._schema = schema;
-			this._schemaUtils = new SchemaUtils['default'](schema);
-			this.step = 0;
-		},
-
-		addRecord: function(type, record){
-			if(!record) return;
-			var serialized = this._serializer.serializeRecord(type, record);
-			this.transformCache({ op: 'add', path: [type, this.getId(type, record)], value: record });
-			this.emit("recordAdded", type, record);
-			return record;
-		},
-
-		addRecords: function(type, records){
+		init: function(transformable, listener, schema){
 			var _this = this;
-			records.forEach(function(record){
-				_this.addRecord(type, record);
+			this._schema = schema;
+			this._listener = listener;
+
+			transformable.on("didTransform", function(operation){
+				_this._process(operation);
 			});
-			return records;
 		},
 
-		removeRecord: function(type, id){
-			if(!this._cache.retrieve([type, id])) return;
+		_process: function(operation){
+			console.log("checking", operation);
+			if(['add', 'replace'].indexOf(operation.op) === -1) return;
+			if(operation.path[2] === '__rel') this._processLink(operation);
+			if(operation.path.length === 2) this._processRecord(operation);
 
-			this.transformCache({ op: 'remove', path: [type, id] });
-			this.emit("recordRemoved", type, id);
 		},
 
-		addLink: function(type, typeId, link, linkId){
-			console.log("firebase-cache.addLink", [type, typeId, link, linkId]);
-			var linkType = this._schemaUtils.lookupLinkDef(type, link).type;
+		_processRecord: function(operation){
+			var _this = this;
+			var record = operation.value;
+			var modelType = operation.path[0];
+			var modelSchema = this._schema.models[modelType];
 
-			if(linkType === "hasOne") return this.setHasOne(type, typeId, link, linkId);
-			if(linkType === "hasMany") return this.addToHasMany(type, typeId, link, linkId);
-			throw new Error("Link type not handled: " + linkType);
-		},
+			Object.keys(modelSchema.links).forEach(function(link){
+				var linkDef = _this._schema.models[modelType].links[link];
+				var linkType = _this._schema.singularize(link);
 
-		removeLink: function(type, typeId, link, linkId){
-			var linkType = this._schemaUtils.lookupLinkDef(type, link).type;
-
-			if(linkType === "hasOne") return this.setHasOne(type, typeId, link, null);
-			if(linkType === "hasMany") return this.removeFromHasMany(type, typeId, link, linkId);
-			throw new Error("Link type not handled: " + linkType);
-		},
-
-		setHasOne: function(type, typeId, link, linkId){
-			if(this._cacheUtils.retrieveLink(type, typeId, link) === linkId) return;
-			this.transformCache({ op: "add", path: [type, typeId, "__rel", link], value: linkId});
-		},
-
-		addToHasMany: function(type, typeId, link, linkId){
-			var hasManyArray = Object.keys(this._cacheUtils.retrieveLink(type, typeId, link));
-			debugger
-			console.log("addToHasMany", hasManyArray, linkId);
-			if(hasManyArray.indexOf(linkId) !== -1) return;
-			this.transformCache({ op: "add", path: [type, typeId, "__rel", link, linkId], value: true});
-		},
-
-		removeFromHasMany: function(type, typeId, link, linkId){
-			var hasManyArray = this._cacheUtils.retrieveLink(type, typeId, link);
-			if(hasManyArray.indexOf(linkId) === -1) return;
-			this.transformCache({ op: "remove", path: [type, typeId, "__rel", link, linkId] });
-		},
-
-		updateAttribute: function(type, typeId, attribute, value){
-			var currentValue = this._cache.retrieve([type, typeId, attribute]);
-			if(currentValue === value) return;
-			this.transformCache({ op: "replace", path: [type, typeId, attribute], value: value });
-		},
-
-		updateMeta: function(type, typeId, meta, value){
-			var currentValue = this._cache.retrieve([type, typeId, meta]);
-			if(currentValue === value) return;
-			this.transformCache({ op: "replace", path: [type, typeId, meta], value: value });	
-		},
-
-		updateLink: function(type, typeId, link, newValue){
-			var _this = this,
-				linkType = this._schemaUtils.lookupLinkDef(type, link).type,
-				currentValue = this._cacheUtils.retrieveLink(type, typeId, link),
-				cacheLinkPath = [type, typeId, "__rel", link];
-
-			if(linkType === "hasOne"){
-				if(newValue === currentValue) return;
-				_this.transformCache({op: 'replace', path: cacheLinkPath, value: newValue});
-			}
-			else if(linkType === "hasMany"){
-				var currentLinkIds = currentValue||[];
-				var newLinkIds = newValue||[];
-
-				var added = newLinkIds.filter(function(linkId){
-					return currentLinkIds.indexOf(linkId) === -1;
-				});
-
-				var removed = currentLinkIds.filter(function(linkId){
-					return newLinkIds.indexOf(linkId) === -1;
-				});
-				
-				added.forEach(function(linkId){
-					var path = cacheLinkPath.concat([linkId]);
-					try{
-						_this.transformCache({op: 'add', path: path, value: true});
-
+				if(linkDef.type === 'hasOne'){
+					if(record.__rel[link]){
+						var id = record.__rel[link];
+						_this._listener.subscribeToRecord(linkDef.model, id);
 					}
-					catch(error){
-						debugger
+
+				} else if (linkDef.type === 'hasMany'){
+					if(record.__rel[link]){
+						var ids = Object.keys(record.__rel[link]);
+						_this._listener.subscribeToRecords(linkDef.model, ids);
 					}
-				});
+				}
 
-				removed.forEach(function(linkId){
-					var path = cacheLinkPath.concat([linkId]);
-					_this.transformCache({op: 'remove', path: path});
-				});
-			}		
+			});
 		},
 
-		transformCache: function(operation) {
-			this.step += 1;
-			console.log("t => " + operation.op + " " + operation.path.join("/") + " " + operation.value);
+		_processLink: function(operation){
+			var modelType = operation.path[0];
+			var link = operation.path[3];
+			var linkDef = this._schema.models[modelType].links[link];
+			var linkType = linkDef.model;
+			var relationshipType = linkDef.type;
+			var id, ids;
 
-			// if(this.step % 100 === 1){
-			// 	debugger
-			// }
+			if(relationshipType === 'hasMany'){
+				if(operation.path.length === 4){
+					ids = Object.keys(operation.value);
+					this._listener.subscribeToRecords(linkType, ids);
 
-			this.validateOperation(operation);
-			console.log("transformCache", operation);
-			var pathToVerify,
-			inverse;
+				} else if (operation.path.length === 5){
+					id = operation.path[4];
+					this._listener.subscribeToRecord(linkType, id);
 
-			if (operation.op === 'add') {
-				pathToVerify = operation.path.slice(0, operation.path.length - 1);
-			} else {
-				pathToVerify = operation.path;
+				}
+
+			} else if (relationshipType === 'hasOne'){
+				id = operation.value;
+				this._listener.subscribeToRecord(linkType, id);
+
 			}
-
-			if (this._cache.retrieve(pathToVerify)) {
-		      	this._cache.transform(operation);
-
-		  	} else if (operation.op === 'replace') {
-		      	// try adding instead of replacing if the cache does not yet contain
-		      	// the data
-		      	operation.op = 'add';
-		      	this.transformCache(operation);
-
-		  	} else {
-		      	// if the cache can't be transformed because, still trigger `didTransform`
-		      	//
-		      	// NOTE: this is not an error condition, since the local cache will often
-		      	// be sparsely populated compared with the remote store
-		      	// try {
-		      		this._cache.transform(operation, []);
-				// }
-				// catch(error){
-				// 	debugger
-				// }	  	
-		  	}
-		},
-
-		validateOperation: function(operation){
-			var validOperations = ["add", "remove", "replace", "copy", "move", "test"];
-			if(validOperations.indexOf(operation.op) === -1) throw new Error("Invalid operation: " + operation.op);
-			if(operation.path[-1] === "_rel") throw new Error("Relationship not specified");
-		},
-
-		getId: function(type, data) {
-			if (objects.isObject(data)) {
-				return data[this._schema.models[type].primaryKey.name];
-			} else {
-				return data;
+			else {
+				throw new Error("Relationship type not supported: " + relationshipType);
 			}
 		}
 	});
 
 });
-define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit/main', 'orbit-firebase/array-utils'], function (exports, objects, Orbit, array_utils) {
+define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit/main', 'orbit-firebase/lib/array-utils'], function (exports, objects, Orbit, array_utils) {
 
 	'use strict';
 
@@ -233,20 +113,12 @@ define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit
 		set: function(path, value){
 			path = this._normalizePath(path);
 
-			console.log("firebase.set:" + path, value);
 			var _this = this;
 			return new Orbit['default'].Promise(function(resolve, reject){
-				console.log("setting:" + path, value);
-				try{
-					value = value || null; // undefined causes error in firebase client
-					_this.firebaseRef.child(path).set(value, function(error){
-						console.log(error);
-						error ? reject(error) : resolve(value); // jshint ignore:line
-					});
-				}
-				catch(error){
-					debugger
-				}
+				value = value || null; // undefined causes error in firebase client
+				_this.firebaseRef.child(path).set(value, function(error){
+					error ? reject(error) : resolve(value); // jshint ignore:line
+				});
 			});
 
 		},
@@ -254,7 +126,7 @@ define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit
 		push: function(path, value){
 			var _this = this;
 			return new Promise(function(resolve, reject){
-				this.firebaseRef.child(path).push(value, function(error){
+				_this.firebaseRef.child(path).push(value, function(error){
 					if(error) {
 						reject(error);
 					}
@@ -267,8 +139,7 @@ define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit
 
 		remove: function(path){
 			var _this = this;
-			var path = this._normalizePath(path);
-			console.log("firebase.remove:", path);
+			path = this._normalizePath(path);
 
 			return new Orbit['default'].Promise(function(resolve, reject){
 				_this.firebaseRef.child(path).remove(function(error){
@@ -277,11 +148,25 @@ define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit
 			});
 		},
 
+		valueAt: function(path){
+			var _this = this;
+			path = this._normalizePath(path);
+
+			return new Orbit['default'].Promise(function(resolve, reject){
+				_this.firebaseRef.child(path).once('value', function(snapshot){
+
+					resolve(snapshot.val());
+
+				}, function(error){
+					reject(reject);
+				});
+			});
+		},
+		
 		removeFromArray: function(arrayPath, value){
 			var _this = this;
 
 			return this.valueAt(arrayPath).then(function(array){
-				debugger
 				if(!array) return;
 				console.log(array);
 
@@ -300,7 +185,7 @@ define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit
 			return this.valueAt(arrayPath).then(function(array){
 				if(!array) return;
 
-				array = array_utils.removeAt(array, index)
+				array = array_utils.removeAt(array, index);
 				return _this.set(arrayPath, array);
 			});
 		},		
@@ -319,42 +204,56 @@ define('orbit-firebase/firebase-client', ['exports', 'orbit/lib/objects', 'orbit
 			});
 		},
 
-		valueAt: function(path){
-			var _this = this;
-			path = this._normalizePath(path);
-
-			return new Orbit['default'].Promise(function(resolve, reject){
-				_this.firebaseRef.child(path).once('value', function(snapshot){
-
-					resolve(snapshot.val());
-
-				}, function(error){
-					reject(reject);
-				});
-			});
-		},
-
 	    _normalizePath: function(path) {
 	    	return (typeof path === 'string') ? path : path.join('/');
 	    },	
 	});
 
 });
-define('orbit-firebase/firebase-operation-queues', ['exports', 'orbit/lib/objects', 'orbit/evented', 'orbit/operation'], function (exports, objects, Evented, Operation) {
+define('orbit-firebase/firebase-connector', ['exports', 'orbit/transform-connector'], function (exports, TransformConnector) {
+
+	'use strict';
+
+	exports['default'] = TransformConnector['default'].extend({
+		filterFunction: function(operation){
+			var path = operation.path;
+			var recordPath = [path[0], path[1]];
+			var record = this.target.retrieve(recordPath);
+
+			if(!record && path.length > 2){
+				return false;
+			}
+
+			return true;
+		}
+	});
+
+});
+define('orbit-firebase/firebase-listener', ['exports', 'orbit/lib/objects', 'orbit/evented', 'orbit-firebase/lib/schema-utils', 'orbit/operation'], function (exports, objects, Evented, SchemaUtils, Operation) {
 
 	'use strict';
 
 	exports['default'] = objects.Class.extend({
-		init: function(firebaseRef, schema){
+		init: function(firebaseRef, schema, serializer){
 			Evented['default'].extend(this);
+
 			this._firebaseRef = firebaseRef;
-			this._subscriptions = {};
-			this._receivedOperations = {};
 			this._schema = schema;
+			this._schameUtils = new SchemaUtils['default'](schema);
+			this._serializer = serializer;
+
+			this._firebaseListeners = {};
 		},
 
 		subscribeToType: function(type){
-			this._subscribeTo([type]);
+			console.log("subscribing to type", type);
+			var _this = this;
+			var typeRef = this._firebaseRef.child('type');
+			this._enableListener(type, 'child_added', function(snapshot){
+				var record = snapshot.val();
+				console.log("record added", record);
+				_this.subscribeToRecord(type, record.id);
+			});
 		},
 
 		subscribeToRecords: function(type, ids){
@@ -365,103 +264,162 @@ define('orbit-firebase/firebase-operation-queues', ['exports', 'orbit/lib/object
 		},
 
 		subscribeToRecord: function(type, id){
-			this._subscribeTo([type, id]);
-		},
-
-		enqueue: function(operation){
-			if(!operation.id) throw new Error("operation must have an id");
-			console.log("op:" + operation.id + " fb-op-queues.enqueue", operation.serialize());
-
+			console.log("subscribing to record", [type, id]);
 			var _this = this;
-			var queues = this._queuesForOperation(operation);
-			var serializedOperation = this._serializeOperation(operation);
+			var modelSchema = this._schema.models[type];
+			var path = [type, id].join("/");
 
-			queues.forEach(function(queue){
-				var queuePath = _this._queuePathFor(queue);
-				console.log("sending", serializedOperation)
-				_this._firebaseRef.child(queuePath).push(serializedOperation);
+			this._enableListener(path, "value", function(snapshot){
+				var value = snapshot.val();
+
+				if(value){
+					var deserializedRecord = _this._serializer.deserialize(type, id, snapshot.val());
+					console.log("adding record", [type, id]);
+					_this._emitDidTransform(new Operation['default']({ op: 'add', path: path, value: deserializedRecord }) );
+				} else {
+					_this._emitDidTransform(new Operation['default']({ op: 'remove', path: path }));
+				}
+
+			});
+
+			Object.keys(modelSchema.attributes).forEach(function(attribute){
+				_this._subscribeToAttribute(type, id, attribute);
+			});
+
+			Object.keys(modelSchema.links).forEach(function(link){
+				_this._subscribeToLink(type, id, link);
 			});
 		},
 
 		unsubscribeAll: function(){
 			var _this = this;
-			Object.keys(this._subscriptions).forEach(function(queuePath){
-				var callback = _this._subscriptions[queuePath];
-				_this._firebaseRef.child(queuePath).orderByChild('date').limitToLast(1).off("child_added", callback);
+			Object.keys(this._firebaseListeners).forEach(function(listenerKey){
+				var path = listenerKey.split(":")[0];
+				var eventType = listenerKey.split(":")[1];
+				var callback = _this._firebaseListeners[listenerKey];
+
+				_this._disableListener(path, eventType, callback);
 			});
 		},
 
-		_queuesForOperation: function(operation){
-			var path = (typeof operation.path === 'string') ? operation.path.split("/") : operation.path;
-			return [
-				[path[0]],
-				[path[0], path[1]]
-			];
+		_subscribeToAttribute: function(type, id, attribute){
+			console.log("subscribing to attribute", [type, id, attribute].join("/"));
+			var _this = this,
+			path = [type, id, attribute].join("/");
+
+			this._enableListener(path, "value", function(snapshot){
+				console.log("attribute updated", snapshot.val());
+				_this._emitDidTransform(new Operation['default']({ op: 'replace', path: path, value: snapshot.val() }));
+			});
 		},
 
-		_subscribeTo: function(path){
+		_subscribeToLink: function(type, id, link){
+			console.log("subscribing to link", [type, id, link].join("/"));
 			var _this = this;
-			var queuePath = this._queuePathFor(path);
+			var linkType = this._schameUtils.lookupLinkDef(type, link).type;
 
-			if(this._subscriptions[queuePath]) return;
-			console.log("subscribing to", queuePath);
+			if(linkType === 'hasOne'){
+				this._subscribeToHasOne(type, id, link);
 
-			var callbackReady = false;
-			var callback = function(snapshot){
-				var operation = _this._deserializeOperation(snapshot.val());
-				// if(callbackReady){
-					_this._emitDidTransform(operation);
-				// }
-				// else {
-				// 	callbackReady = true; // discards first operation as we only want new children (by default firebase sends the last existing operation when the child_added listener is attached)
-				// }
+			} else if (linkType === 'hasMany'){
+				this._subscribeToHasMany(type, id, link);
+
+			} else {
+				throw new Error("Unsupported link type: " + linkType);
 			}
-
-			this._subscriptions[queuePath] = callback;
-
-			this._firebaseRef.child(queuePath).orderByChild('date').limitToLast(1).on('child_added', callback);
+			
 		},
 
-		_queuePathFor: function(path){
-			var joinedPath = (typeof path === 'string') ? path : path.join("/");
-			return "operation-queues/" + joinedPath + "/operations";
+		_subscribeToHasOne: function(type, id, link){
+			var _this = this;
+			var path = [type, id, link].join("/");
+
+			this._enableListener(path, "value", function(snapshot){
+				console.log("from hasOne", snapshot.val());
+
+				var key = snapshot.key(),
+				value = snapshot.val();
+
+				if(value){
+					_this._emitDidTransform(new Operation['default']({ 
+						op: 'replace', 
+						path: [type, id, '__rel', link].join("/"), 
+						value: value 
+					}));
+					
+				} else {
+					_this._emitDidTransform(new Operation['default']({ 
+						op: 'remove', 
+						path: [type, id, '__rel', link].join("/")
+					}));
+
+				}
+			});
 		},
 
-		_serializeOperation: function(operation){		
-			var serialized = {
-				date: Firebase.ServerValue.TIMESTAMP,
-				operation: JSON.stringify({ // firebase removes keys with null values, by stringifying the operation the keys are retained
-					id: operation.id,
-					op: operation.op,
-					path: operation.path,
-					value: operation.value||null,
-					log: operation.log||null
-				})
-			}
+		_subscribeToHasMany: function(type, id, link){
+			var _this = this;
+			var path = [type, id, link].join("/");
 
-			return serialized;
-		},
+			this._enableListener(path, "child_added", function(snapshot){
+				console.log("child_added to hasMany", snapshot.val());
+				_this._emitDidTransform(new Operation['default']({ 
+					op: 'add', 
+					path: [type, id, '__rel', link, snapshot.key()].join("/"), 
+					value: snapshot.val() 
+				}));
+			});
 
-		_deserializeOperation: function(serialized){
-			return new Operation['default'](JSON.parse(serialized.operation));
+			this._enableListener(path, "child_removed", function(snapshot){
+				console.log("child_remove from hasMany", snapshot.val());
+				_this._emitDidTransform(new Operation['default']({
+					op: 'remove',
+					path: [type, id, '__rel', link, snapshot.key()].join("/")
+				}));
+			});
 		},
 
 		_emitDidTransform: function(operation){
-			if(!this._receivedOperations[operation.id]){
-				this._receivedOperations[operation.id] = true;
-				console.log("op:" + operation.id + " fb-op-queues._emitDidTransform", operation.serialize());
-				this.emit("didTransform", operation);
-			}
+			console.log("emitting", operation.serialize());
+			this.emit("didTransform", operation);
+		},
+
+		_enableListener: function(path, eventType, callback){
+			path = (typeof path === 'string') ? path : path.join('/');
+			var key = this._buildListenerKey(path, eventType);
+
+			if(this._listenerExists(key)) return;
+
+			this._firebaseRef.child(path).on(eventType, callback);
+			this._firebaseListeners[key] = callback;
+		},
+
+		_disableListener: function(path, eventType, callback){
+			this._firebaseRef.child(path).off(eventType, callback);
+		},
+
+		_listenerExists: function(key){
+			return this._firebaseListeners[key];
+		},
+
+		_buildListenerKey: function(path, eventType){
+			return [path, eventType].join(":");
+		},
+
+		_normalizePath: function(path) {
+			return (typeof path === 'string') ? path.split("/") : path;
 		}
 	});
 
 });
-define('orbit-firebase/firebase-requester', ['exports', 'orbit/lib/objects', 'orbit-firebase/object-utils', 'orbit-firebase/schema-utils', 'orbit/main'], function (exports, objects, object_utils, SchemaUtils, Orbit) {
+define('orbit-firebase/firebase-requester', ['exports', 'orbit/lib/objects', 'orbit-firebase/lib/object-utils', 'orbit-firebase/lib/schema-utils', 'orbit/main', 'orbit/lib/assert', 'orbit-common/lib/exceptions'], function (exports, objects, object_utils, SchemaUtils, Orbit, assert, exceptions) {
 
 	'use strict';
 
 	exports['default'] = objects.Class.extend({
 		init: function(firebaseClient, schema, serializer){
+			assert.assert('FirebaseSource requires Orbit.map be defined', Orbit['default'].map);
+
 			this._firebaseClient = firebaseClient;
 			this._schema = schema;
 			this._schemaUtils = new SchemaUtils['default'](schema);
@@ -469,7 +427,13 @@ define('orbit-firebase/firebase-requester', ['exports', 'orbit/lib/objects', 'or
 		},
 
 		find: function(type, id){
-			return id ? this._findOne(type, id) : this._findAll(type);
+			if(id){
+				if(objects.isArray(id)) return this._findMany(type, id);
+				return this._findOne(type, id);
+			}
+			else {
+				return this._findAll(type);
+			}
 		},
 
 		findLink: function(type, id, link){
@@ -501,9 +465,18 @@ define('orbit-firebase/firebase-requester', ['exports', 'orbit/lib/objects', 'or
 
 			return _this._firebaseClient.valueAt([type, id]).then(function(record){
 				// todo - is this the correct behaviour for not found?
-				if(!record) return record;
+				if(!record) throw new exceptions.RecordNotFoundException(type + ":" + id);
 				return _this._serializer.deserialize(type, id, record);
 			});
+		},
+
+		_findMany: function(type, ids){
+			var _this = this;
+			var promises = object_utils.reduce(ids, function(id){
+				return _this._findOne(type, id);
+			});
+
+			return Orbit['default'].all(promises);
 		},
 
 		_findAll: function(type){
@@ -594,15 +567,8 @@ define('orbit-firebase/firebase-serializer', ['exports', 'orbit-common/serialize
 			var linkNames = Object.keys(modelSchema.links);
 
 			linkNames.forEach(function(link){
-				var linkDef = modelSchema.links[link];
 				var value = record.__rel[link];
-
-				if(linkDef.type === 'hasMany'){
-					json[link] = Object.keys(value||{});
-				}
-				else {
-					json[link] = value;
-				}
+				json[link] = value;
 			});
 		},
 
@@ -621,13 +587,11 @@ define('orbit-firebase/firebase-serializer', ['exports', 'orbit-common/serialize
 			this.deserializeAttributes(type, record, data);
 			this.deserializeLinks(type, record, data);
 
-			return data;
+			return this.schema.normalize(type, data);
 		},
 
 		deserializeKeys: function(type, id, record, data){
 			data[this.schema.models[type].primaryKey.name] = id;
-			data.__id = id;
-			data.id = id;
 		},
 
 		deserializeAttributes: function(type, record, data){
@@ -648,23 +612,23 @@ define('orbit-firebase/firebase-serializer', ['exports', 'orbit-common/serialize
 			data.__rel = {};
 
 			Object.keys(modelSchema.links).forEach(function(link) {
+				var value;
 				var linkDef = modelSchema.links[link];
-				var value = record[link]||{};
 
-				// if(linkDef.type === "hasMany"){
-				// 	value = _this.buildHash(value||[], true)
-				// }
+				if(linkDef.type === "hasOne"){
+					value = record[link];
+				}
+				else if(linkDef.type === "hasMany"){
+					value = record[link] || {};
+				}
 
 				data.__rel[link] = value;
 			});
 		},
 
 		buildHash: function(keys, value){
-			if(!objects.isArray(keys)){
-				debugger
-			}
 			var hash = {};
-			
+
 			keys.forEach(function(key){
 				hash[key] = value;
 			});
@@ -674,7 +638,7 @@ define('orbit-firebase/firebase-serializer', ['exports', 'orbit-common/serialize
 
 		resourceKey: function(type) {
 			return 'id';
-		},	
+		},
 
 		resourceType: function(type) {
 			return this.schema.pluralize(type);
@@ -690,39 +654,18 @@ define('orbit-firebase/firebase-serializer', ['exports', 'orbit-common/serialize
 	});
 
 });
-define('orbit-firebase/firebase-source', ['exports', 'orbit/lib/objects', 'orbit/main', 'orbit/lib/assert', 'orbit-common/source', 'orbit-firebase/object-utils', 'orbit/transform-connector', 'orbit/transformable', 'orbit/operation', 'orbit-firebase/firebase-client', 'orbit-firebase/firebase-requester', 'orbit-firebase/firebase-transformer', 'orbit-firebase/firebase-serializer', 'orbit-firebase/firebase-operation-queues', 'orbit-firebase/firebase-utils', 'orbit-firebase/firebase-cache', 'orbit-firebase/operation-matcher', 'orbit-firebase/operation-decomposer', 'orbit-firebase/schema-utils'], function (exports, objects, Orbit, assert, Source, object_utils, TransformConnector, Transformable, Operation, FirebaseClient, FirebaseRequester, FirebaseTransformer, FirebaseSerializer, FirebaseOperationQueues, FirebaseUtils, FirebaseCache, OperationMatcher, OperationDecomposer, SchemaUtils) {
+define('orbit-firebase/firebase-source', ['exports', 'orbit/lib/objects', 'orbit/main', 'orbit/lib/assert', 'orbit-common/source', 'orbit-firebase/lib/object-utils', 'orbit/transform-connector', 'orbit/operation', 'orbit-firebase/firebase-client', 'orbit-firebase/firebase-requester', 'orbit-firebase/firebase-transformer', 'orbit-firebase/firebase-serializer', 'orbit-firebase/firebase-listener', 'orbit-firebase/firebase-connector', 'orbit-firebase/cache-source', 'orbit-firebase/eager-relationship-loader', 'orbit-firebase/operation-matcher', 'orbit-firebase/operation-decomposer', 'orbit-firebase/lib/schema-utils', 'orbit-firebase/lib/operation-utils'], function (exports, objects, Orbit, assert, Source, object_utils, TransformConnector, Operation, FirebaseClient, FirebaseRequester, FirebaseTransformer, FirebaseSerializer, FirebaseListener, FirebaseConnector, CacheSource, EagerRelationshipLoader, OperationMatcher, OperationDecomposer, SchemaUtils, operation_utils) {
 
 	'use strict';
-
-	var CacheSource = objects.Class.extend({
-		init: function(cache){
-			Transformable['default'].extend(this);
-			this._cache = cache;
-			objects.expose(this, this._cache, ['retrieve']);
-		},
-
-		_transform: function(operations){
-			var _this = this;
-			operations = objects.isArray(operations) ? operations : [operations];
-
-			operations.forEach(function(operation){
-				_this._cache.transform(operation);
-			});
-
-			this.settleTransforms();
-		}
-	});
-
 
 	exports['default'] = Source['default'].extend({
 		notifierName: "firebase-source",
 
 		init: function(schema, options){
-			var _this = this,
-				options = options || {};
+			var _this = this;
+			options = options || {};
 
 			this._super.apply(this, arguments);
-			window.firebaseSource = this;
 
 			assert.assert('FirebaseSource requires Orbit.Promise be defined', Orbit['default'].Promise);
 			assert.assert('FirebaseSource requires Orbit.all be defined', Orbit['default'].all);
@@ -730,27 +673,27 @@ define('orbit-firebase/firebase-source', ['exports', 'orbit/lib/objects', 'orbit
 			assert.assert('FirebaseSource requires Orbit.resolve be defined', Orbit['default'].resolve);
 			assert.assert('FirebaseSource requires firebaseRef be defined', options.firebaseRef);
 
-			window.firebaseSource = this;
-
 			var firebaseRef = options.firebaseRef;
 			var serializer = new FirebaseSerializer['default'](schema);
 			var firebaseClient = new FirebaseClient['default'](firebaseRef);
 
 			this._firebaseTransformer = new FirebaseTransformer['default'](firebaseClient, schema, serializer);
 			this._firebaseRequester = new FirebaseRequester['default'](firebaseClient, schema, serializer);
-			this._firebaseOperationQueues = new FirebaseOperationQueues['default'](firebaseRef, schema);
-			this._firebaseOperationQueues.id = "firebaseOperationQueues";
+			this._firebaseListener = new FirebaseListener['default'](firebaseRef, schema, serializer);
 
-			var cacheSource = new CacheSource(this._cache);
-			cacheSource.id = "cacheSource";
-			var connector = new TransformConnector['default'](this._firebaseOperationQueues, cacheSource);
-			connector.id = "fromFirebase";
-			this._cache.on("didTransform", function(operation){
-				console.log("**** cacheDidTransform", operation);
+			var cacheSource = new CacheSource['default'](this._cache);
+			this._firebaseConnector = new FirebaseConnector['default'](this._firebaseListener, cacheSource);
+			this.on("didTransform", function(operation){
+				console.log("fb.transmitting", operation.serialize());
 			})
 		},
 
+		disconnect: function(){
+			this._firebaseListener.unsubscribeAll();
+		},
+
 		_transform: function(operation){
+			console.log("fb.transform", operation.serialize());
 			var _this = this;
 
 			return this._firebaseTransformer.transform(operation).then(function(result){
@@ -764,14 +707,14 @@ define('orbit-firebase/firebase-source', ['exports', 'orbit/lib/objects', 'orbit
 					operation.value = _this.schema.normalize(operation.path[0], operation.value);
 				}
 
-				_this._firebaseOperationQueues.enqueue(operation);
+				_this._cache.transform(operation);
 			});
 		},
 
 		_find: function(type, id){
 			var _this = this;
 			return this._firebaseRequester.find(type, id).then(function(records){
-				if(!id) _this._firebaseOperationQueues.subscribeToType(type);
+				if(!id) _this._firebaseListener.subscribeToType(type);
 				_this._subscribeToRecords(type, records);
 				return _this._addRecordsToCache(type, records);
 			});
@@ -793,34 +736,30 @@ define('orbit-firebase/firebase-source', ['exports', 'orbit/lib/objects', 'orbit
 
 		_subscribeToRecords: function(type, records){
 			records = objects.isArray(records) ? records : [records];
-			this._firebaseOperationQueues.subscribeToRecords(type, object_utils.pluck(records, 'id'));
+			this._firebaseListener.subscribeToRecords(type, object_utils.pluck(records, 'id'));
 		},
 
 		_addRecordsToCache: function(type, recordOrRecords) {
-			console.log("addingRecordsToCache", recordOrRecords);
 			var _this = this;
 			var records = objects.isArray(recordOrRecords) ? recordOrRecords : [recordOrRecords];
 
-			var promisedRecords = object_utils.reduce(records, function(record) {
+			records.forEach(function(record){
 				_this._addRecordToCache(type, record);
 			});
 
-			console.log("calling settleTransforms from firebase-souce");
 			return this.settleTransforms().then(function(){
 				return recordOrRecords;
 			});
 		},
 
 		_addRecordToCache: function(type, record) {
-			console.log('op:' + record.id, "fb-source._addRecordToCache");
-			console.log("adding record to cache", record);
 			var operation = new Operation['default']({
 				op: 'add',
 				path: [type, record.id],
 				value: record
 			});
 
-			this._cache.transform(operation);
+			this._firebaseConnector.transform(operation);
 		},
 	});
 
@@ -873,157 +812,64 @@ define('orbit-firebase/firebase-transformer', ['exports', 'orbit/lib/objects', '
 	});
 
 });
-define('orbit-firebase/firebase-utils', ['exports', 'orbit/lib/objects', 'orbit/main'], function (exports, objects, Orbit) {
+define('orbit-firebase/lib/array-utils', ['exports'], function (exports) {
+
+	'use strict';
+
+	exports.removeItem = removeItem;
+	exports.removeAt = removeAt;
+	exports.reduce = reduce;
+	exports.pluck = pluck;
+
+	function removeItem(array, condemned){
+		return array.filter(function(item){
+			return item !== condemned;
+		});
+	}
+
+	function removeAt(array, index){
+		var working = array.splice(0);
+		working.splice(index, 1);
+		return working;
+	}
+
+	function reduce(array, callback){
+		var reduced = [];
+
+		for(var i = 0; i < array.length; i++){
+			reduced[i] = callback(array[i]);
+		}
+
+		return reduced;
+	}
+
+	function pluck(array, property){
+		return reduce(array, function(item){
+			return item[property];
+		});
+	}
+
+});
+define('orbit-firebase/lib/cache-utils', ['exports', 'orbit/lib/objects'], function (exports, objects) {
 
 	'use strict';
 
 	exports['default'] = objects.Class.extend({
-		init: function(firebaseRef, schema, serializer){
-			this.firebaseRef = firebaseRef;
-			this._schema = schema;
-			this._serializer = serializer;
+		init: function(cache){
+			this.cache = cache;
 		},
 
-		addRecord: function(type, id, record){
-			var path = [type, id].join("/");
-
-			if(!record.id) {
-				throw new Error("Tried to add a watch for a record with no id: " + JSON.stringify(record));
+		retrieveLink: function(type, id, link) {
+			var val = this.cache.retrieve([type, id, '__rel', link]);
+			if (val !== null && typeof val === 'object') {
+				val = Object.keys(val);
 			}
-			if(record.id === "true"){
-				throw new Error("Tried to add a watch for a record with an id of 'true': " + JSON.stringify(record));
-			}
-
-			return this.set(path, record);
+			return val;
 		},
-
-		removeRecord: function(type, id){
-			var path = [type, id].join("/");
-			return this.remove(path);
-		},
-
-		addLink: function(type, typeId, link, linkId){
-			var linkDef = this._schema.models[type].links[link];
-			var firepath = [type, typeId, link].join("/");
-			if(linkDef.type === "hasMany") return this.appendToArray(firepath, linkId);
-			if(linkDef.type === "hasOne") return this.set(firepath, linkId);
-			throw new Error("No addLink handler for link type: " + linkDef.type);
-		},
-
-		removeLink: function(type, typeId, link, linkId){
-			var linkDef = this._schema.models[type].links[link];
-			var firepath = [type, typeId, link].join("/");
-			if(linkDef.type === "hasMany") return this.removeFromArray(firepath, linkId);
-			if(linkDef.type === "hasOne") return this.set(firepath, null);
-			throw new Error("No removeLink handler for link type: " + linkDef.type);
-		},
-
-		replaceLink: function(type, typeId, link, linkValue){
-			var firepath = [type, typeId, link].join("/");
-			return this.set(firepath, linkValue);
-		},
-
-		updateAttribute: function(type, typeId, attribute, value){
-			var path = [type, typeId, attribute].join("/");
-			return this.set(path, value);
-		},
-
-		findOne: function(type, id){
-			var _this = this;
-			var path = [type, id].join("/");
-			return _this.valueAt(path).then(function(record){
-				// todo - is this the correct behaviour for not found?
-				if(!record) return record;
-				var deserialized = _this._serializer.deserialize(type, id, record);
-				return deserialized;
-			});
-		},
-
-		findAll: function(type){
-			var _this = this;
-			return _this.valueAt(type).then(function(recordsHash){
-				var records = _this.objectValues(recordsHash);
-				var deserialized = _this._serializer.deserializeRecords(type, records);
-				return deserialized;
-			});
-		},
-
-		objectValues: function(object){
-			if(!object) return [];
-			return Object.keys(object).map(function(key){
-				return object[key];
-			});
-		},
-
-		set: function(path, value){
-			console.log("firebase.set:" + path, value);
-			var _this = this;
-			return new Orbit['default'].Promise(function(resolve, reject){
-				console.log("setting:" + path, value);
-				try{
-					value = value || null; // undefined causes error in firebase client
-					_this.firebaseRef.child(path).set(value, function(error){
-						error ? reject(error) : resolve(value); // jshint ignore:line
-					});
-				}
-				catch(error){
-					debugger
-				}
-			});
-
-		},
-
-		remove: function(path){
-			var _this = this;
-			return new Orbit['default'].Promise(function(resolve, reject){
-				_this.firebaseRef.child(path).remove(function(error){
-					error ? reject(error) : resolve(); // jshint ignore:line
-				});
-			});
-		},
-
-		removeFromArray: function(arrayPath, value){
-			var _this = this;
-
-			return this.valueAt(arrayPath).then(function(array){
-				if(!array) return;
-
-				var index = array.indexOf(value);
-				if(index === -1) return Orbit['default'].resolve();
-
-				array.splice(index, 1);
-				return _this.set(arrayPath, array);
-			});
-		},
-
-		appendToArray: function(arrayPath, value){
-			var _this = this;
-			return _this.valueAt(arrayPath).then(function(array){
-				array = array || [];
-				if(array.indexOf(value) === -1){
-					array.push(value);
-				}
-				return _this.set(arrayPath, array);	
-
-			});
-		},
-
-		valueAt: function(path){
-			var _this = this;
-			return new Orbit['default'].Promise(function(resolve, reject){
-				_this.firebaseRef.child(path).once('value', function(snapshot){
-
-					resolve(snapshot.val());
-
-				}, function(error){
-					reject(reject);
-				});
-			});
-		}
 	});
 
 });
-define('orbit-firebase/object-utils', ['exports'], function (exports) {
+define('orbit-firebase/lib/object-utils', ['exports'], function (exports) {
 
 	'use strict';
 
@@ -1055,7 +901,65 @@ define('orbit-firebase/object-utils', ['exports'], function (exports) {
 	}
 
 });
-define('orbit-firebase/operation-decomposer', ['exports', 'orbit/lib/objects', 'orbit-firebase/operation-matcher', 'orbit-firebase/schema-utils', 'orbit-firebase/cache-utils', 'orbit/operation'], function (exports, objects, OperationMatcher, SchemaUtils, CacheUtils, Operation) {
+define('orbit-firebase/lib/operation-utils', ['exports', 'orbit/lib/objects', 'orbit-firebase/lib/array-utils'], function (exports, objects, array_utils) {
+
+	'use strict';
+
+	exports.fop = fop;
+
+	function formatOperation(operation){
+		var formatted = {
+			id: operation.id,
+			op: operation.op,
+			path: (typeof operation.path === 'string') ? operation.path : operation.path.join("/")
+		};	
+
+		if(operation.value) formatted.value = operation.value;
+
+		return formatted;
+	}
+
+	function fop(operationOrOperations){
+		if(objects.isArray(operationOrOperations)){
+			return array_utils.reduce(operationOrOperations, function(operation){
+				return formatOperation(operation);
+			});
+		}
+		else {
+			return formatOperation(operationOrOperations);
+		}
+	}
+
+});
+define('orbit-firebase/lib/schema-utils', ['exports', 'orbit/lib/objects'], function (exports, objects) {
+
+	'use strict';
+
+	exports['default'] = objects.Class.extend({
+		init: function(schema){
+			this.schema = schema;
+		},
+
+		lookupLinkDef: function(model, link){
+			var modelSchema = this.schema.models[model];
+			var linkDef = modelSchema.links[link];
+			return linkDef;
+		},
+
+		lookupRelatedLinkDef: function(model, link){
+			var linkDef = this.lookupLinkDef(model, link);
+			return this.schema.models[linkDef.model].links[linkDef.inverse];
+		},
+
+		linkTypeFor: function(model, link){
+			var linkDef = this.lookupLinkDef(model, link);
+			if(!linkDef) throw new Error("Could not find type for " + model + "/" + link);
+			return linkDef.type;
+		}
+	});
+
+});
+define('orbit-firebase/operation-decomposer', ['exports', 'orbit/lib/objects', 'orbit-firebase/operation-matcher', 'orbit-firebase/lib/schema-utils', 'orbit-firebase/lib/cache-utils', 'orbit/operation'], function (exports, objects, OperationMatcher, SchemaUtils, CacheUtils, Operation) {
 
 	'use strict';
 
@@ -1129,9 +1033,7 @@ define('orbit-firebase/operation-decomposer', ['exports', 'orbit/lib/objects', '
 			if(this.hasVisited(path)) return;
 			this.markVisited(path);
 
-			console.log("visiting", [op, path, value].join("|"));
 			var linkType = this.schemaUtils.linkTypeFor(path[0], path[3]);
-			console.log("visiting", [linkType, op, path, value].join("|"));
 
 			if(!path[1]) throw new Error("invalid modelId: " + op + "|" + path + "|" + value);
 
@@ -1235,11 +1137,8 @@ define('orbit-firebase/operation-decomposer', ['exports', 'orbit/lib/objects', '
 
 		decompose: function(operation){
 			if(operation.path[2] !== "__rel") return [operation];
-			console.log("decomposing", [operation.op, operation.path.join("/"), operation.value].join(", "));
 			var relationshipResolver = new RelationshipResolver(this.schema, this.cache);
-			console.log("original", operation);
 			var normalized = this.normalize(operation);
-			console.log("normalized", normalized);
 			relationshipResolver.visit(normalized.op, normalized.path, normalized.value);
 			return relationshipResolver.operations;
 		},
@@ -1256,7 +1155,7 @@ define('orbit-firebase/operation-decomposer', ['exports', 'orbit/lib/objects', '
 					op: operation.op, 
 					path: path, 
 					value: this.cache.retrieve(path)
-				}
+				};
 			}
 			if(linkDef.type === "hasMany" && (['add', 'remove'].indexOf(operation.op) !== -1)) {
 				return { 
@@ -1270,7 +1169,7 @@ define('orbit-firebase/operation-decomposer', ['exports', 'orbit/lib/objects', '
 					op: operation.op,
 					path: operation.path,
 					value: Object.keys(operation.value)	
-				}
+				};
 			}
 			return operation;
 		}
@@ -1296,53 +1195,18 @@ define('orbit-firebase/operation-matcher', ['exports', 'orbit/lib/objects', 'orb
 		},
 
 		_determineValueType: function(path, schema){
-			try {
-				if(path.length === 1) return 'type';
-				if(path.length === 2) return 'record';
-				if(path.length === 5) return 'link';
-				if(path.length === 4 && path[2] === "__rel") return 'link';
-				if(path[2].match(/^__/)) return "meta";
+			if(path.length === 1) return 'type';
+			if(path.length === 2) return 'record';
+			if(path.length === 5) return 'link';
+			if(path.length === 4 && path[2] === "__rel") return 'link';
+			if(path[2].match(/^__/)) return "meta";
 
-				var model = schema.models[path[0]];
-				var key = path[2];
-				if(model.attributes[key]) return 'attribute';
-				if(model.keys[key]) return 'key';
-				throw "Unable to determine value type at: " + path.join("/");
-			}
-			catch(error){
-				debugger
-			}
+			var model = schema.models[path[0]];
+			var key = path[2];
+			if(model.attributes[key]) return 'attribute';
+			if(model.keys[key]) return 'key';
+			throw "Unable to determine value type at: " + path.join("/");
 		},	
-	});
-
-});
-define('orbit-firebase/schema-utils', ['exports', 'orbit/lib/objects'], function (exports, objects) {
-
-	'use strict';
-
-	exports['default'] = objects.Class.extend({
-		init: function(schema){
-			this.schema = schema;
-		},
-
-		lookupLinkDef: function(model, link){
-			var modelSchema = this.schema.models[model];
-			if(!modelSchema) debugger;
-			var linkDef = modelSchema.links[link];
-			if(!linkDef) debugger;//throw "Unable to find linkDef for: " + [model, link].join("/");
-			return linkDef;
-		},
-
-		lookupRelatedLinkDef: function(model, link){
-			var linkDef = this.lookupLinkDef(model, link);
-			return this.schema.models[linkDef.model].links[linkDef.inverse];
-		},
-
-		linkTypeFor: function(model, link){
-			var linkDef = this.lookupLinkDef(model, link);
-			if(!linkDef) throw new Error("Could not find type for " + model + "/" + link);
-			return linkDef.type;
-		}
 	});
 
 });
@@ -1371,7 +1235,7 @@ define('orbit-firebase/transformers/add-record', ['exports', 'orbit/lib/objects'
 	});
 
 });
-define('orbit-firebase/transformers/add-to-has-many', ['exports', 'orbit/lib/objects', 'orbit-firebase/schema-utils', 'orbit-firebase/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
+define('orbit-firebase/transformers/add-to-has-many', ['exports', 'orbit/lib/objects', 'orbit-firebase/lib/schema-utils', 'orbit-firebase/lib/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
 
 	'use strict';
 
@@ -1390,12 +1254,12 @@ define('orbit-firebase/transformers/add-to-has-many', ['exports', 'orbit/lib/obj
 
 		transform: function(operation){
 			var path = array_utils.removeItem(operation.path, '__rel');
-			return this._firebaseClient.appendToArray(path, operation.value);
+			return this._firebaseClient.set(path, operation.value);
 		}
 	});
 
 });
-define('orbit-firebase/transformers/add-to-has-one', ['exports', 'orbit/lib/objects', 'orbit-firebase/schema-utils', 'orbit-firebase/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
+define('orbit-firebase/transformers/add-to-has-one', ['exports', 'orbit/lib/objects', 'orbit-firebase/lib/schema-utils', 'orbit-firebase/lib/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
 
 	'use strict';
 
@@ -1419,7 +1283,7 @@ define('orbit-firebase/transformers/add-to-has-one', ['exports', 'orbit/lib/obje
 	});
 
 });
-define('orbit-firebase/transformers/remove-from-has-many', ['exports', 'orbit/lib/objects', 'orbit-firebase/schema-utils', 'orbit-firebase/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
+define('orbit-firebase/transformers/remove-from-has-many', ['exports', 'orbit/lib/objects', 'orbit-firebase/lib/schema-utils', 'orbit-firebase/lib/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
 
 	'use strict';
 
@@ -1443,7 +1307,7 @@ define('orbit-firebase/transformers/remove-from-has-many', ['exports', 'orbit/li
 	});
 
 });
-define('orbit-firebase/transformers/remove-has-one', ['exports', 'orbit/lib/objects', 'orbit-firebase/schema-utils', 'orbit-firebase/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
+define('orbit-firebase/transformers/remove-has-one', ['exports', 'orbit/lib/objects', 'orbit-firebase/lib/schema-utils', 'orbit-firebase/lib/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
 
 	'use strict';
 
@@ -1505,7 +1369,7 @@ define('orbit-firebase/transformers/replace-attribute', ['exports', 'orbit/lib/o
 	});
 
 });
-define('orbit-firebase/transformers/replace-has-many', ['exports', 'orbit/lib/objects', 'orbit-firebase/schema-utils', 'orbit-firebase/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
+define('orbit-firebase/transformers/replace-has-many', ['exports', 'orbit/lib/objects', 'orbit-firebase/lib/schema-utils', 'orbit-firebase/lib/array-utils'], function (exports, objects, SchemaUtils, array_utils) {
 
 	'use strict';
 
